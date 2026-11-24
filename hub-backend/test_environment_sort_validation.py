@@ -22,7 +22,7 @@ class EnvironmentSortValidationTests(unittest.IsolatedAsyncioTestCase):
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         tables = [model.__table__ for model in (
-            models.OrgUnit, models.Role, models.User, models.AuditLog, am.Environment,
+            models.OrgUnit, models.Role, models.User, models.AuditLog, am.Environment, am.SecretReference,
         )]
         async with self.engine.begin() as connection:
             await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=tables))
@@ -62,6 +62,28 @@ class EnvironmentSortValidationTests(unittest.IsolatedAsyncioTestCase):
             headers["Authorization"] = "Bearer " + sign_token(who, 1)
         return await self.http.request(method, "/api/v1/admin/environments" + suffix,
                                        headers=headers, **kwargs)
+
+    async def test_system_secret_reference_probe_requires_super_admin(self):
+        from unittest.mock import AsyncMock, patch
+        async with self.sessions() as session:
+            session.add(am.SecretReference(id="system-secret", name="System secret"))
+            await session.commit()
+        with patch.object(environments.svc, "probe_secret_ref", new_callable=AsyncMock) as probe:
+            response = await self.http.post("/api/v1/admin/secret-references/system-secret/probe",
+                                            headers={"Authorization": "Bearer " + sign_token("manager", 1)})
+            self.assertEqual(response.status_code, 403, response.text)
+            probe.assert_not_awaited()
+
+    async def test_new_environment_requires_an_existing_organization(self):
+        async with self.sessions() as session:
+            session.add(models.User(id="super", username="super", is_super=True, is_active=True, auth_version=1))
+            await session.commit()
+        for org in ("missing", {"id": "wrong shape"}):
+            response = await self.request("POST", who="super", json={"key": "new-env", "orgId": org})
+            self.assertEqual(response.status_code, 400, response.text)
+        await self.assert_unchanged()
+        response = await self.request("POST", who="super", json={"key": "new-env", "orgId": "own-org"})
+        self.assertEqual(response.status_code, 200, response.text)
 
     async def assert_unchanged(self):
         async with self.sessions() as session:
